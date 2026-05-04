@@ -2,6 +2,7 @@ import os
 import math
 import csv
 import io
+import random
 import sqlite3
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -21,8 +22,17 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+
+# Simplified server layout:
+# HABIT_CHANNEL_ID  -> #habit-tracker
+# REPORT_CHANNEL_ID -> #progress-feed
 HABIT_CHANNEL_ID = int(os.getenv("HABIT_CHANNEL_ID", "0"))
 REPORT_CHANNEL_ID = int(os.getenv("REPORT_CHANNEL_ID", "0"))
+
+# Optional. If left empty, streak/fact posts go to REPORT_CHANNEL_ID.
+STREAK_CHANNEL_ID = int(os.getenv("STREAK_CHANNEL_ID", "0"))
+FACTS_CHANNEL_ID = int(os.getenv("FACTS_CHANNEL_ID", "0"))
+
 DISCORD_PROXY = os.getenv("DISCORD_PROXY")
 
 TZ = ZoneInfo(os.getenv("TZ", "Asia/Shanghai"))
@@ -76,12 +86,30 @@ def init_db():
                 channel_id TEXT NOT NULL,
                 posted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS daily_streak_posts (
+                post_date TEXT PRIMARY KEY,
+                channel_id TEXT NOT NULL,
+                posted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS daily_fact_posts (
+                post_date TEXT PRIMARY KEY,
+                channel_id TEXT NOT NULL,
+                posted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
 
 
 def today_str():
     return datetime.now(TZ).date().isoformat()
+
+
+def date_range_for_days(days: int):
+    end_date = datetime.now(TZ).date()
+    start_date = end_date - timedelta(days=days - 1)
+    return start_date, end_date
 
 
 def add_habit(user_id: str, name: str, points: int):
@@ -276,34 +304,53 @@ def get_todays_daily_messages():
     return [dict(row) for row in rows]
 
 
-def report_already_posted(report_date: str):
+def _already_posted(table_name: str, date_col: str, date_value: str):
     with connect_db() as conn:
         row = conn.execute(
-            """
-            SELECT report_date
-            FROM daily_reports
-            WHERE report_date = ?
-            """,
-            (report_date,),
+            f"SELECT {date_col} FROM {table_name} WHERE {date_col} = ?",
+            (date_value,),
         ).fetchone()
 
     return row is not None
 
 
-def mark_report_posted(report_date: str, channel_id: int):
+def _mark_posted(table_name: str, date_col: str, date_value: str, channel_id: int):
     with connect_db() as conn:
         conn.execute(
-            """
-            INSERT OR IGNORE INTO daily_reports (report_date, channel_id)
+            f"""
+            INSERT OR IGNORE INTO {table_name} ({date_col}, channel_id)
             VALUES (?, ?)
             """,
-            (report_date, str(channel_id)),
+            (date_value, str(channel_id)),
         )
 
 
+def report_already_posted(report_date: str):
+    return _already_posted("daily_reports", "report_date", report_date)
+
+
+def mark_report_posted(report_date: str, channel_id: int):
+    _mark_posted("daily_reports", "report_date", report_date, channel_id)
+
+
+def streak_post_already_posted(post_date: str):
+    return _already_posted("daily_streak_posts", "post_date", post_date)
+
+
+def mark_streak_posted(post_date: str, channel_id: int):
+    _mark_posted("daily_streak_posts", "post_date", post_date, channel_id)
+
+
+def fact_post_already_posted(post_date: str):
+    return _already_posted("daily_fact_posts", "post_date", post_date)
+
+
+def mark_fact_posted(post_date: str, channel_id: int):
+    _mark_posted("daily_fact_posts", "post_date", post_date, channel_id)
+
+
 def stats_for_user(user_id: str, days: int):
-    end_date = datetime.now(TZ).date()
-    start_date = end_date - timedelta(days=days - 1)
+    start_date, end_date = date_range_for_days(days)
 
     habits = get_habits(user_id)
     result = []
@@ -343,8 +390,7 @@ def stats_for_user(user_id: str, days: int):
 
 
 def get_daily_completion_counts(user_id: str, days: int):
-    end_date = datetime.now(TZ).date()
-    start_date = end_date - timedelta(days=days - 1)
+    start_date, _ = date_range_for_days(days)
     habits = get_habits(user_id)
 
     results = []
@@ -403,6 +449,87 @@ def get_streak_info(user_id: str, days: int = 365):
     }
 
 
+def valid_days_count(user_id: str, days: int = 30) -> int:
+    daily = get_daily_completion_counts(user_id, days)
+    return sum(1 for day in daily if day["total"] > 0 and day["rate"] >= VALID_DAY_RATE)
+
+
+def perfect_days_count(user_id: str, days: int = 30) -> int:
+    daily = get_daily_completion_counts(user_id, days)
+    return sum(1 for day in daily if day["total"] > 0 and day["rate"] == 1)
+
+
+def get_best_and_worst_habits(user_id: str, days: int = 30):
+    habits = get_habits(user_id)
+
+    if not habits:
+        return None, None
+
+    start_date, _ = date_range_for_days(days)
+    rows = []
+
+    for habit in habits:
+        completed = 0
+
+        for i in range(days):
+            current_date = start_date + timedelta(days=i)
+
+            if is_completed(user_id, habit["id"], current_date.isoformat()):
+                completed += 1
+
+        rate = completed / days if days else 0
+
+        rows.append(
+            {
+                "name": habit["name"],
+                "completed": completed,
+                "days": days,
+                "rate": rate,
+            }
+        )
+
+    best = max(rows, key=lambda x: x["rate"])
+    worst = min(rows, key=lambda x: x["rate"])
+
+    return best, worst
+
+
+def get_most_dangerous_weekday(user_id: str, days: int = 60):
+    daily = get_daily_completion_counts(user_id, days)
+
+    weekday_data = {}
+
+    for day in daily:
+        weekday = day["date"].strftime("%A")
+
+        if weekday not in weekday_data:
+            weekday_data[weekday] = {"total": 0, "failed": 0}
+
+        weekday_data[weekday]["total"] += 1
+
+        valid = day["total"] > 0 and day["rate"] >= VALID_DAY_RATE
+
+        if not valid:
+            weekday_data[weekday]["failed"] += 1
+
+    if not weekday_data:
+        return None
+
+    weekday, data = max(
+        weekday_data.items(),
+        key=lambda item: item[1]["failed"] / item[1]["total"] if item[1]["total"] else 0,
+    )
+
+    fail_rate = data["failed"] / data["total"] if data["total"] else 0
+
+    return {
+        "weekday": weekday,
+        "failed": data["failed"],
+        "total": data["total"],
+        "fail_rate": fail_rate,
+    }
+
+
 def get_user_summary(user_id: str, days: int = 30):
     habits = get_habits(user_id)
     daily = get_daily_completion_counts(user_id, days)
@@ -454,6 +581,14 @@ def get_user_summary(user_id: str, days: int = 30):
     }
 
 
+async def get_display_name(guild: discord.Guild, user_id: str) -> str:
+    try:
+        member = guild.get_member(int(user_id)) or await guild.fetch_member(int(user_id))
+        return member.display_name
+    except Exception:
+        return f"User {user_id}"
+
+
 # ======================
 # Visual helpers
 # ======================
@@ -482,9 +617,7 @@ def load_font(size: int, bold: bool = False):
 
 
 def create_progress_table_image(display_name: str, user_id: str, days: int = 30) -> io.BytesIO:
-    end_date = datetime.now(TZ).date()
-    start_date = end_date - timedelta(days=days - 1)
-
+    start_date, end_date = date_range_for_days(days)
     habits = get_habits(user_id)
 
     if not habits:
@@ -554,9 +687,7 @@ def create_progress_table_image(display_name: str, user_id: str, days: int = 30)
     gray_box = (95, 102, 116)
     gray_box_dark = (83, 89, 102)
 
-    blue = (100, 145, 225)
     blue_soft = (72, 99, 153)
-
     separator = (58, 63, 74)
 
     img = Image.new("RGB", (width, height), bg)
@@ -903,7 +1034,6 @@ def create_heatmap_image(display_name: str, user_id: str, days: int = 90) -> io.
 
     cell = 24
     gap = 7
-    weekday_label_w = 44
     top_grid_y = 150
     left_grid_x = 78
 
@@ -1024,9 +1154,7 @@ def create_heatmap_image(display_name: str, user_id: str, days: int = 90) -> io.
 
 
 def export_user_progress_csv(user_id: str, days: int) -> io.StringIO:
-    end_date = datetime.now(TZ).date()
-    start_date = end_date - timedelta(days=days - 1)
-
+    start_date, _ = date_range_for_days(days)
     habits = get_habits(user_id)
 
     output = io.StringIO()
@@ -1061,6 +1189,95 @@ def export_user_progress_csv(user_id: str, days: int) -> io.StringIO:
 
     output.seek(0)
     return output
+
+
+# ======================
+# Random facts
+# ======================
+
+async def generate_random_fact(guild: discord.Guild, days: int = 30) -> str:
+    user_ids = get_active_user_ids()
+
+    if not user_ids:
+        return "No active users yet. Add habits first with `/addhabit`."
+
+    facts = []
+
+    for user_id in user_ids:
+        name = await get_display_name(guild, user_id)
+
+        streak = get_streak_info(user_id, 365)
+        summary = get_user_summary(user_id, days)
+        best, worst = get_best_and_worst_habits(user_id, days)
+        dangerous_day = get_most_dangerous_weekday(user_id, 60)
+
+        facts.append(
+            f"🔥 **{name}** is currently on a **{streak['current_streak']}-day streak**. "
+            f"Best streak: **{streak['best_streak']}**."
+        )
+
+        facts.append(
+            f"📊 **{name}** completed **{summary['total_completed']}/{summary['total_possible']}** habits "
+            f"in the last **{days} days** — **{summary['overall_rate']:.0%}** overall."
+        )
+
+        facts.append(
+            f"💯 **{name}** had **{perfect_days_count(user_id, days)} perfect days** in the last **{days} days**."
+        )
+
+        facts.append(
+            f"✅ **{name}** had **{valid_days_count(user_id, days)} valid days** in the last **{days} days**."
+        )
+
+        if best:
+            facts.append(
+                f"🏆 **{name}'s** strongest habit is **{best['name']}**: "
+                f"**{best['completed']}/{best['days']}** — **{best['rate']:.0%}**."
+            )
+
+        if worst:
+            facts.append(
+                f"🧊 **{name}'s** weakest habit is **{worst['name']}**: "
+                f"**{worst['completed']}/{worst['days']}** — **{worst['rate']:.0%}**. Suspicious behavior."
+            )
+
+        if dangerous_day:
+            facts.append(
+                f"⚠️ **{name}'s** most dangerous weekday is **{dangerous_day['weekday']}**: "
+                f"failed **{dangerous_day['failed']}/{dangerous_day['total']}** times."
+            )
+
+        next_milestone = ((streak["current_streak"] // 5) + 1) * 5
+        remaining = next_milestone - streak["current_streak"]
+
+        facts.append(
+            f"🎯 **{name}** is **{remaining} valid day(s)** away from a **{next_milestone}-day streak**."
+        )
+
+    if len(user_ids) >= 2:
+        summaries = []
+
+        for user_id in user_ids:
+            name = await get_display_name(guild, user_id)
+            summary = get_user_summary(user_id, days)
+
+            summaries.append(
+                {
+                    "name": name,
+                    "rate": summary["overall_rate"],
+                    "completed": summary["total_completed"],
+                    "possible": summary["total_possible"],
+                }
+            )
+
+        leader = max(summaries, key=lambda x: x["rate"])
+
+        facts.append(
+            f"⚔️ Current **{days}-day leader** is **{leader['name']}** with "
+            f"**{leader['completed']}/{leader['possible']}** habits completed — **{leader['rate']:.0%}**."
+        )
+
+    return random.choice(facts)
 
 
 # ======================
@@ -1160,6 +1377,7 @@ class DailyHabitView(discord.ui.View):
 
         habits = get_habits(user_id)
 
+        # Discord allows max 25 buttons/components in one message.
         for habit in habits[:25]:
             done = is_completed(user_id, habit["id"], log_date)
             self.add_item(
@@ -1535,6 +1753,75 @@ async def heatmap(interaction: discord.Interaction, days: int = 90):
     )
 
 
+@bot.tree.command(name="streak", description="Show your current and best streak.")
+@app_commands.describe(user="Optional user to check")
+async def streak(interaction: discord.Interaction, user: discord.Member = None):
+    target = user or interaction.user
+    user_id = str(target.id)
+
+    if not get_habits(user_id):
+        await interaction.response.send_message(
+            f"{target.display_name} has no habits yet.",
+            ephemeral=True,
+        )
+        return
+
+    streak_info = get_streak_info(user_id, 365)
+    today_summary = daily_summary(user_id, today_str())
+
+    status = "Alive 🔥" if today_summary["valid_day"] else "Not safe yet ⚠️"
+
+    embed = discord.Embed(
+        title=f"🔥 {target.display_name}'s Streak",
+        color=discord.Color.orange(),
+    )
+
+    embed.add_field(
+        name="Current Streak",
+        value=f"**{streak_info['current_streak']}** days",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Best Streak",
+        value=f"**{streak_info['best_streak']}** days",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Today",
+        value=(
+            f"{today_summary['completed']}/{today_summary['total']} habits — "
+            f"{today_summary['rate']:.0%}\n"
+            f"Status: **{status}**"
+        ),
+        inline=False,
+    )
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="fact", description="Post a random habit fact.")
+@app_commands.describe(days="Number of days to analyze")
+async def fact(interaction: discord.Interaction, days: int = 30):
+    if days < 7 or days > 180:
+        await interaction.response.send_message(
+            "Choose between 7 and 180 days.",
+            ephemeral=True,
+        )
+        return
+
+    fact_text = await generate_random_fact(interaction.guild, days=days)
+
+    embed = discord.Embed(
+        title="🎲 Random Habit Fact",
+        description=fact_text,
+        color=discord.Color.blurple(),
+    )
+
+    await interaction.response.send_message(embed=embed)
+
+
 @bot.tree.command(name="report", description="Post the daily progress report manually.")
 @app_commands.describe(days="Number of days to show")
 async def report(interaction: discord.Interaction, days: int = 30):
@@ -1545,10 +1832,8 @@ async def report(interaction: discord.Interaction, days: int = 30):
         )
         return
 
-    channel = interaction.channel
-
     await interaction.response.defer(ephemeral=True)
-    await post_daily_progress_report(channel, days=days, force=True)
+    await post_daily_progress_report(interaction.channel, days=days, force=True)
 
     await interaction.followup.send(
         "✅ Progress report posted.",
@@ -1556,8 +1841,30 @@ async def report(interaction: discord.Interaction, days: int = 30):
     )
 
 
+@bot.tree.command(name="streakreport", description="Post the streak report manually.")
+async def streakreport(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    await post_daily_streak_report(interaction.channel, force=True)
+    await interaction.followup.send("✅ Streak report posted.", ephemeral=True)
+
+
+@bot.tree.command(name="factreport", description="Post the random fact manually.")
+@app_commands.describe(days="Number of days to analyze")
+async def factreport(interaction: discord.Interaction, days: int = 30):
+    if days < 7 or days > 180:
+        await interaction.response.send_message(
+            "Choose between 7 and 180 days.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    await post_daily_random_fact(interaction.channel, days=days, force=True)
+    await interaction.followup.send("✅ Random fact posted.", ephemeral=True)
+
+
 # ======================
-# Auto daily panel/report
+# Auto daily panel/report/streak/fact
 # ======================
 
 async def post_daily_panel_for_user(channel: discord.TextChannel, user_id: str):
@@ -1643,10 +1950,81 @@ async def post_daily_progress_report(
         mark_report_posted(report_date, channel.id)
 
 
+async def post_daily_streak_report(
+    channel: discord.TextChannel,
+    force: bool = False,
+):
+    post_date = today_str()
+
+    if not force and streak_post_already_posted(post_date):
+        return
+
+    user_ids = get_active_user_ids()
+
+    if not user_ids:
+        await channel.send("No active users/habits found yet.")
+        return
+
+    lines = []
+
+    for user_id in user_ids:
+        name = await get_display_name(channel.guild, user_id)
+        streak_info = get_streak_info(user_id, 365)
+        today_summary = daily_summary(user_id, post_date)
+
+        if today_summary["valid_day"]:
+            status = "alive 🔥"
+        else:
+            needed_total = math.ceil(today_summary["total"] * VALID_DAY_RATE)
+            needed = max(0, needed_total - today_summary["completed"])
+            status = f"not safe yet — needs {needed} more ⚠️"
+
+        lines.append(
+            f"**{name}** — Current: **{streak_info['current_streak']}** | "
+            f"Best: **{streak_info['best_streak']}** | Today: **{status}**"
+        )
+
+    embed = discord.Embed(
+        title=f"🔥 Daily Streak Check — {post_date}",
+        description="\n".join(lines),
+        color=discord.Color.orange(),
+    )
+
+    await channel.send(embed=embed)
+
+    if not force:
+        mark_streak_posted(post_date, channel.id)
+
+
+async def post_daily_random_fact(
+    channel: discord.TextChannel,
+    days: int = 30,
+    force: bool = False,
+):
+    post_date = today_str()
+
+    if not force and fact_post_already_posted(post_date):
+        return
+
+    fact_text = await generate_random_fact(channel.guild, days=days)
+
+    embed = discord.Embed(
+        title="🎲 Daily Random Habit Fact",
+        description=fact_text,
+        color=discord.Color.blurple(),
+    )
+
+    await channel.send(embed=embed)
+
+    if not force:
+        mark_fact_posted(post_date, channel.id)
+
+
 @tasks.loop(minutes=1)
 async def morning_panels():
     now = datetime.now(TZ)
 
+    # Posts once daily at 09:00 according to TZ.
     if now.hour != 9 or now.minute != 0:
         return
 
@@ -1663,9 +2041,52 @@ async def morning_panels():
 
 
 @tasks.loop(minutes=1)
+async def daily_random_fact():
+    now = datetime.now(TZ)
+
+    # Game loading-screen fact at noon.
+    if now.hour != 12 or now.minute != 0:
+        return
+
+    channel_id = FACTS_CHANNEL_ID or REPORT_CHANNEL_ID
+
+    if not channel_id:
+        return
+
+    channel = bot.get_channel(channel_id)
+
+    if channel is None:
+        return
+
+    await post_daily_random_fact(channel, days=30, force=False)
+
+
+@tasks.loop(minutes=1)
+async def daily_streak_report():
+    now = datetime.now(TZ)
+
+    # Warning before close. Gives you 29 minutes to save the day.
+    if now.hour != 23 or now.minute != 30:
+        return
+
+    channel_id = STREAK_CHANNEL_ID or REPORT_CHANNEL_ID
+
+    if not channel_id:
+        return
+
+    channel = bot.get_channel(channel_id)
+
+    if channel is None:
+        return
+
+    await post_daily_streak_report(channel, force=False)
+
+
+@tasks.loop(minutes=1)
 async def daily_progress_report():
     now = datetime.now(TZ)
 
+    # Final daily visual report.
     if now.hour != 23 or now.minute != 59:
         return
 
@@ -1686,6 +2107,12 @@ async def on_ready():
 
     if not morning_panels.is_running():
         morning_panels.start()
+
+    if not daily_random_fact.is_running():
+        daily_random_fact.start()
+
+    if not daily_streak_report.is_running():
+        daily_streak_report.start()
 
     if not daily_progress_report.is_running():
         daily_progress_report.start()
